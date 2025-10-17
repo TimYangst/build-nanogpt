@@ -20,7 +20,7 @@ class CasualSelfAttention(nn.Module):
         # Embedding dimension
         self.n_embd = config.n_embd
         # Causal mask to ensure that attention is only applied to the left in the input sequence
-        self.register_buffer("mask", torch.tril(torch.ones(config.block_size, config.block_size))
+        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                      .view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x):
@@ -37,7 +37,7 @@ class CasualSelfAttention(nn.Module):
         # Compute attention scores
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
         # Apply causal mask to the attention scores
-        att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float('-inf'))
+        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
         # Apply softmax to get attention weights
         att = F.softmax(att, dim=-1)
         # Compute the output of the attention mechanism
@@ -89,11 +89,11 @@ class Block(nn.Module):
 # GPT model configuration
 @dataclass
 class GPTConfig:
-    block_size: int = 256  # Maximum sequence length
-    vocab_size: int = 65   # Number of tokens in the vocabulary
-    n_layer: int = 6       # Number of transformer blocks
-    n_head: int = 6        # Number of attention heads
-    n_embd: int = 384      # Embedding dimension
+    block_size: int = 1024    # Maximum sequence length
+    vocab_size: int = 50257   # Number of tokens in the vocabulary
+    n_layer: int = 12          # Number of transformer blocks
+    n_head: int = 12           # Number of attention heads
+    n_embd: int = 768         # Embedding dimension
 
 # GPT model
 class GPT(nn.Module):
@@ -114,41 +114,53 @@ class GPT(nn.Module):
         ))
         # Language model head to project the output to the vocabulary size
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # Weight tying between token embedding and language model head
-        self.transformer.wte.weight = self.lm_head.weight
-        # Initialize weights
-        self.apply(self._init_weights)
+       
+    @classmethod
+    def from_pretrained(cls, model_type):
+        """Load a pre-trained GPT model"""
+        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}, "Unsupported model type"
+        from transformers import GPT2LMHeadModel
+        print(f"Loading pre-trained model: {model_type}")
 
-    def _init_weights(self, module):
-        # Initialize weights for linear and embedding layers
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        config_args = {
+            'gpt2': dict(n_layer=12, n_head=12, n_embd=768),
+            'gpt2-medium': dict(n_layer=24, n_head=16, n_embd=1024),
+            'gpt2-large': dict(n_layer=36, n_head=20, n_embd=1280),
+            'gpt2-xl': dict(n_layer=48, n_head=25, n_embd=1600),
+        }[model_type]
 
-    def forward(self, idx, targets=None):
-        # Get input dimensions
-        B, T = idx.size()
-        # Ensure sequence length is within the block size
-        assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
-        # Get positional embeddings
-        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (T, n_embd)
-        # Get token embeddings
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (B, T, n_embd)
-        # Add token and positional embeddings
-        x = tok_emb + pos_emb
-        # Forward pass through the transformer blocks
-        for block in self.transformer.h:
-            x = block(x)
-        # Final layer normalization
-        x = self.transformer.ln_f(x)
-        # Get logits from the language model head
-        logits = self.lm_head(x) # (B, T, vocab_size)
-        # Compute loss if targets are provided
-        loss = None
-        if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-        return logits, loss
+        config_args['vocab_size'] = 50257
+        config_args['block_size'] = 1024
+
+        config = GPTConfig(**config_args)
+        model = GPT(config)
+
+        sd = model.state_dict()
+        sd_keys = set(sd.keys())
+        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')]
+
+        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+        sd_hf = model_hf.state_dict()
+
+        sd_keys_hf = sd_hf.keys()
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')]
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')]
+
+        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+
+        assert len(sd_keys) == len(sd_keys_hf), f"State dict keys do not match in length: {len(sd_keys)} != {len(sd_keys_hf)}"
+
+        for k in sd_keys_hf:
+          if any(k.endswith(w) for w in transposed):
+              assert sd[k].shape[::-1] == sd_hf[k].shape, f"Shape mismatch for {k}"
+              with torch.no_grad():
+                  sd[k].copy_(sd_hf[k].t())
+          else:
+              assert sd_hf[k].shape == sd[k].shape, f"Shape mismatch for {k}"
+              with torch.no_grad():
+                  sd[k].copy_(sd_hf[k])
+
+        return model
+    
+model = GPT.from_pretrained('gpt2')
+print("Model loaded successfully.")
