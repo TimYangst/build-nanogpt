@@ -202,41 +202,52 @@ class GPT(nn.Module):
 
         return model
     
+# Load the pre-trained GPT-2 model
 model = GPT.from_pretrained('gpt2')
 print("Loaded pre-trained GPT-2 model successfully.")
 
+# Set the number of sequences to generate and the maximum length of each sequence
 num_return_squences = 5
 max_length = 30
 
+# Set the model to evaluation mode and move it to the specified device
 model.eval()
 model.to('cuda')
 
+# Import the tiktoken library for encoding and decoding text
 import tiktoken
 enc = tiktoken.get_encoding("gpt2")
+# Encode the input text into tokens
 tokens = enc.encode("Hello, I'm a language model,")
 tokens = torch.tensor(tokens, dtype=torch.long)
+# Reshape the tokens tensor to have a batch dimension and repeat it for the number of return sequences
 tokens = tokens.unsqueeze(0).repeat(num_return_squences, 1)
 x = tokens.to('cuda')
 
-# generate, right now, x is (B, T) where B = 5, T = 8
-# set random seed to 42
+# Set the random seed for reproducibility
 torch.manual_seed(42)
 torch.cuda.manual_seed(42)
 
+# Generate tokens until the sequence length reaches the maximum length
 while x.size(1) < max_length:
+    # Disable gradient calculation for inference
     with torch.no_grad():
+        # Get the logits from the model
         logits = model(x)
-        # take the logits from the last position
-        logits = logits[:, -1, :]  # Get the logits for the last token
-        probs = F.softmax(logits, dim=-1)  # Convert logits to probabilities
-        # do top-k sampling of 50
-        # topk_probs here becomes (5, 50), topk_indices is (5, 50)
-        tokprobs, topk_indices = torch.topk(probs, k=50, dim=-1)  # Get top-k probabilities and indices
+        # Get the logits for the last token in the sequence
+        logits = logits[:, -1, :]
+        # Convert the logits to probabilities using softmax
+        probs = F.softmax(logits, dim=-1)
+        # Get the top-k probabilities and indices from the distribution
+        tokprobs, topk_indices = torch.topk(probs, k=50, dim=-1)
+        # Sample the next token from the top-k probabilities
+        ix = torch.multinomial(tokprobs, num_samples=1)
+        # Gather the sampled token indices
+        xcol = torch.gather(topk_indices, -1, ix)
+        # Append the new token to the sequence
+        x = torch.cat((x, xcol), dim=1)
 
-        ix = torch.multinomial(tokprobs, num_samples=1)  # Sample from the top-k probabilities
-        xcol = torch.gather(topk_indices, -1, ix)  # Gather the sampled token indices
-        x = torch.cat((x, xcol), dim=1)  # Append the new token to the sequence
-
+# Decode and print the generated sequences
 for i in range(num_return_squences):
     tokens = x[i, :max_length].tolist()
     decoded = enc.decode(tokens)
