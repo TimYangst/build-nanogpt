@@ -122,6 +122,7 @@ class GPT(nn.Module):
         from transformers import GPT2LMHeadModel
         print(f"Loading pre-trained model: {model_type}")
 
+        # Create a model configuration based on the model type
         config_args = {
             'gpt2': dict(n_layer=12, n_head=12, n_embd=768),
             'gpt2-medium': dict(n_layer=24, n_head=16, n_embd=1024),
@@ -129,33 +130,46 @@ class GPT(nn.Module):
             'gpt2-xl': dict(n_layer=48, n_head=25, n_embd=1600),
         }[model_type]
 
+        # Set the vocabulary size and block size
         config_args['vocab_size'] = 50257
         config_args['block_size'] = 1024
 
+        # Create a new model with the specified configuration
         config = GPTConfig(**config_args)
         model = GPT(config)
 
+        # Get the state dictionary of the new model
         sd = model.state_dict()
         sd_keys = set(sd.keys())
+        # Remove the attention bias key from the state dictionary keys
         sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')]
 
+        # Load the pre-trained model from Hugging Face
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+        # Get the state dictionary of the pre-trained model
         sd_hf = model_hf.state_dict()
 
+        # Get the keys from the pre-trained model's state dictionary
         sd_keys_hf = sd_hf.keys()
+        # Remove the masked bias and bias keys from the pre-trained model's state dictionary keys
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')]
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')]
 
+        # These weights need to be transposed
         transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
 
+        # Ensure the number of keys in both state dictionaries is the same
         assert len(sd_keys) == len(sd_keys_hf), f"State dict keys do not match in length: {len(sd_keys)} != {len(sd_keys_hf)}"
 
+        # Copy the weights from the pre-trained model to the new model
         for k in sd_keys_hf:
           if any(k.endswith(w) for w in transposed):
+              # Transpose the weights if necessary
               assert sd[k].shape[::-1] == sd_hf[k].shape, f"Shape mismatch for {k}"
               with torch.no_grad():
                   sd[k].copy_(sd_hf[k].t())
           else:
+              # Copy the weights directly
               assert sd_hf[k].shape == sd[k].shape, f"Shape mismatch for {k}"
               with torch.no_grad():
                   sd[k].copy_(sd_hf[k])
@@ -163,4 +177,3 @@ class GPT(nn.Module):
         return model
     
 model = GPT.from_pretrained('gpt2')
-print("Model loaded successfully.")
