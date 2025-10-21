@@ -115,7 +115,7 @@ class GPT(nn.Module):
         # Language model head to project the output to the vocabulary size
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-    def forward(self, idx):
+    def forward(self, idx, targets=None):
         # Get input dimensions: Batch size, Time steps
         B, T = idx.size()
         # Ensure the input sequence length does not exceed the block size
@@ -136,10 +136,14 @@ class GPT(nn.Module):
         # Final layer normalization
         x = self.transformer.ln_f(x)  # (B, T, n_embd)
 
-        # Language model head to get logits for each token in the vocabulary
+        loss = None
+         # Language model head to get logits for each token in the vocabulary
         logits = self.lm_head(x)  # (B, T, vocab_size)
 
-        return logits
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+
+        return logits, loss
        
     @classmethod
     def from_pretrained(cls, model_type):
@@ -208,7 +212,22 @@ if torch.cuda.is_available():
     device = 'cuda'
 elif torch.backends.mps.is_available() and torch.backends.mps.is_available():
     device = 'mps'
+device = 'cpu'  # Force CPU for this example
 print(f"Using device: {device}")
+
+import tiktoken
+enc = tiktoken.get_encoding("gpt2")
+
+with open("data/input.txt", "r") as f:
+    text = f.read()
+data = text[:1000]
+tokens = enc.encode(data)
+
+B, T = 4, 32
+buf = torch.tensor(tokens[:B*T + 1])
+x = buf[:-1].view(B, T)
+y = buf[1:].view(B, T)
+
 
 # Load the pre-trained GPT-2 model
 # model = GPT.from_pretrained('gpt2')
@@ -216,14 +235,23 @@ print(f"Using device: {device}")
 
 # Alternatively, create a new GPT model with default configuration
 model = GPT(GPTConfig())
+model = model.to(device)
+logits, loss = model(x, y)
+
+print("Logits shape:", logits.shape)  # Expected shape: (B, T, vocab_size)
+print("Loss:", loss)
+
+import sys; sys.exit(0)
+
+# Set the model to evaluation mode and move it to the specified device
+model.eval()
+model.to(device)
 
 # Set the number of sequences to generate and the maximum length of each sequence
 num_return_squences = 5
 max_length = 30
 
-# Set the model to evaluation mode and move it to the specified device
-model.eval()
-model.to(device)
+
 
 # Import the tiktoken library for encoding and decoding text
 import tiktoken
