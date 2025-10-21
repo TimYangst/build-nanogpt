@@ -115,6 +115,9 @@ class GPT(nn.Module):
         # Language model head to project the output to the vocabulary size
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
+        # weight sharing between token embedding and language model head
+        self.transformer.wte.weight = self.lm_head.weight
+
     def forward(self, idx, targets=None):
         # Get input dimensions: Batch size, Time steps
         B, T = idx.size()
