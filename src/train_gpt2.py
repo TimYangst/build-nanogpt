@@ -212,7 +212,7 @@ if torch.cuda.is_available():
     device = 'cuda'
 elif torch.backends.mps.is_available() and torch.backends.mps.is_available():
     device = 'mps'
-device = 'cpu'  # Force CPU for this example
+# device = 'cpu'  # Force CPU for this example
 print(f"Using device: {device}")
 
 import tiktoken
@@ -225,6 +225,7 @@ tokens = enc.encode(data)
 
 B, T = 4, 32
 buf = torch.tensor(tokens[:B*T + 1])
+buf = buf.to(device)
 x = buf[:-1].view(B, T)
 y = buf[1:].view(B, T)
 
@@ -236,13 +237,20 @@ y = buf[1:].view(B, T)
 # Alternatively, create a new GPT model with default configuration
 model = GPT(GPTConfig())
 model = model.to(device)
-logits, loss = model(x, y)
+# logits, loss = model(x, y)
 
-print("Logits shape:", logits.shape)  # Expected shape: (B, T, vocab_size)
-print("Loss:", loss)
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for steps in range(50):
+    logits, loss = model(x, y)
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    print(f"Step {steps}, Loss: {loss.item():.4f}")
+
+# print("Logits shape:", logits.shape)  # Expected shape: (B, T, vocab_size)
+# print("Loss:", loss)
 
 import sys; sys.exit(0)
-
 # Set the model to evaluation mode and move it to the specified device
 model.eval()
 model.to(device)
