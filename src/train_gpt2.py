@@ -202,9 +202,20 @@ class GPT(nn.Module):
 
         return model
     
+# Auto detect device
+device = 'cpu'
+if torch.cuda.is_available():
+    device = 'cuda'
+elif torch.backends.mps.is_available() and torch.backends.mps.is_available():
+    device = 'mps'
+print(f"Using device: {device}")
+
 # Load the pre-trained GPT-2 model
-model = GPT.from_pretrained('gpt2')
-print("Loaded pre-trained GPT-2 model successfully.")
+# model = GPT.from_pretrained('gpt2')
+# print("Loaded pre-trained GPT-2 model successfully.")
+
+# Alternatively, create a new GPT model with default configuration
+model = GPT(GPTConfig())
 
 # Set the number of sequences to generate and the maximum length of each sequence
 num_return_squences = 5
@@ -212,7 +223,7 @@ max_length = 30
 
 # Set the model to evaluation mode and move it to the specified device
 model.eval()
-model.to('cuda')
+model.to(device)
 
 # Import the tiktoken library for encoding and decoding text
 import tiktoken
@@ -222,11 +233,12 @@ tokens = enc.encode("Hello, I'm a language model,")
 tokens = torch.tensor(tokens, dtype=torch.long)
 # Reshape the tokens tensor to have a batch dimension and repeat it for the number of return sequences
 tokens = tokens.unsqueeze(0).repeat(num_return_squences, 1)
-x = tokens.to('cuda')
+x = tokens.to(device)
 
 # Set the random seed for reproducibility
 torch.manual_seed(42)
-torch.cuda.manual_seed(42)
+if device == 'cuda':
+    torch.cuda.manual_seed(42)
 
 # Generate tokens until the sequence length reaches the maximum length
 while x.size(1) < max_length:
