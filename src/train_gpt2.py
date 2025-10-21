@@ -15,6 +15,7 @@ class CasualSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         # Linear layer to project the output of the attention mechanism
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
         # Number of attention heads
         self.n_head = config.n_head
         # Embedding dimension
@@ -59,6 +60,7 @@ class MLP(nn.Module):
         self.gelu = nn.GELU(approximate='tanh')
         # Linear layer to project the output back to the original dimension
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
         # Forward pass through the MLP
@@ -117,6 +119,21 @@ class GPT(nn.Module):
 
         # weight sharing between token embedding and language model head
         self.transformer.wte.weight = self.lm_head.weight
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        # Initialize weights for linear and embedding layers
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                std = (2.0 * self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        # Initialize weights for embedding layers
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
         # Get input dimensions: Batch size, Time steps
@@ -243,6 +260,10 @@ class DataLoaderLite:
         if self.current_pos + B * T >= len(self.tokens):
             self.current_pos = 0
         return x, y
+    
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
    
 train_loader = DataLoaderLite(B=4, T=32)
 
@@ -263,7 +284,7 @@ for steps in range(50):
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
-    print(f"Step {steps}, Loss: {loss.item():.4f}")
+    print(f"Step {steps}, Loss: {loss.item()}")
 
 # print("Logits shape:", logits.shape)  # Expected shape: (B, T, vocab_size)
 # print("Loss:", loss)
