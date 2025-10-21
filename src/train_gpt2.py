@@ -216,19 +216,32 @@ elif torch.backends.mps.is_available() and torch.backends.mps.is_available():
 print(f"Using device: {device}")
 
 import tiktoken
-enc = tiktoken.get_encoding("gpt2")
 
-with open("data/input.txt", "r") as f:
-    text = f.read()
-data = text[:1000]
-tokens = enc.encode(data)
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+        self.current_pos = 0
 
-B, T = 4, 32
-buf = torch.tensor(tokens[:B*T + 1])
-buf = buf.to(device)
-x = buf[:-1].view(B, T)
-y = buf[1:].view(B, T)
+        with open("data/input.txt", "r") as f:
+            text = f.read()
+        enc = tiktoken.get_encoding("gpt2")
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+        print(f"Loaded {len(self.tokens)} tokens.")
+        print(f" 1 epoch = {len(self.tokens) // (B * T)} batches.")
 
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_pos : self.current_pos + B * T + 1]
+        x = buf[:-1].view(B, T)
+        y = buf[1:].view(B, T)
+        self.current_pos += B * T
+        if self.current_pos + B * T >= len(self.tokens):
+            self.current_pos = 0
+        return x, y
+   
+train_loader = DataLoaderLite(B=4, T=32)
 
 # Load the pre-trained GPT-2 model
 # model = GPT.from_pretrained('gpt2')
@@ -241,6 +254,8 @@ model = model.to(device)
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for steps in range(50):
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
     logits, loss = model(x, y)
     optimizer.zero_grad()
     loss.backward()
