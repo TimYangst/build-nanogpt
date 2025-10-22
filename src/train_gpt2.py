@@ -442,6 +442,10 @@ if torch.cuda.is_available():
 # B=4: batch size, T=32: sequence length
 train_loader = DataLoaderLite(B=8, T=1024)
 
+# Configure TF32 precision using new API (PyTorch 2.9+)
+torch.backends.cuda.matmul.fp32_precision = 'tf32'
+torch.backends.cudnn.conv.fp32_precision = 'tf32'
+
 # Initialize model
 # Option 1: Load pre-trained GPT-2 weights
 # model = GPT.from_pretrained('gpt2')
@@ -480,9 +484,10 @@ for steps in range(50):
 
     t1 = time.time()
     dt = (t1 - t0) * 1000
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
 
     # Log training progress
-    print(f"Step {steps}, Loss: {loss.item()}, Time per batch: {dt:.2f} ms")
+    print(f"Step {steps}, Loss: {loss.item()}, Time per batch: {dt:.2f} ms, tokens/sec: {tokens_per_sec:.2f}")
 
 # Training complete - exit before generation code
 import sys; sys.exit(0)
