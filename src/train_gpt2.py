@@ -431,6 +431,7 @@ class DataLoaderLite:
 # ============================================================================
 # Training Setup
 # ============================================================================
+import time
 
 # Set random seeds for reproducibility
 torch.manual_seed(1337)
@@ -439,7 +440,7 @@ if torch.cuda.is_available():
 
 # Initialize data loader
 # B=4: batch size, T=32: sequence length
-train_loader = DataLoaderLite(B=4, T=32)
+train_loader = DataLoaderLite(B=8, T=1024)
 
 # Initialize model
 # Option 1: Load pre-trained GPT-2 weights
@@ -459,6 +460,7 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 # ============================================================================
 
 for steps in range(50):
+    t0 = time.time()
     # Get next batch of data
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
@@ -468,13 +470,19 @@ for steps in range(50):
 
     # Backward pass: compute gradients
     optimizer.zero_grad()
+
     loss.backward()
 
     # Update weights
     optimizer.step()
 
+    torch.cuda.synchronize() if device == 'cuda' else None
+
+    t1 = time.time()
+    dt = (t1 - t0) * 1000
+
     # Log training progress
-    print(f"Step {steps}, Loss: {loss.item()}")
+    print(f"Step {steps}, Loss: {loss.item()}, Time per batch: {dt:.2f} ms")
 
 # Training complete - exit before generation code
 import sys; sys.exit(0)
