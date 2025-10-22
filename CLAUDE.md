@@ -58,7 +58,6 @@ The entire GPT-2 implementation is contained in a single file with the following
 **Training Components:**
 - `DataLoaderLite`: Simple data loader that reads from data/input.txt
   - Uses tiktoken GPT-2 encoding
-  - Batches data with (B, T) = (4, 32) by default
   - Auto-loops when reaching end of data
 - Training loop at bottom of file (currently 50 steps with AdamW optimizer, lr=3e-4)
 - Device auto-detection: CUDA > MPS > CPU
