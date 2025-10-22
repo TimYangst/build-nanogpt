@@ -442,6 +442,10 @@ if torch.cuda.is_available():
 # B=4: batch size, T=32: sequence length
 train_loader = DataLoaderLite(B=8, T=1024)
 
+torch.set_float32_matmul_precision('high')
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 # Initialize model
 # Option 1: Load pre-trained GPT-2 weights
 # model = GPT.from_pretrained('gpt2')
