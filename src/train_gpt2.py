@@ -5,7 +5,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 # Causal Self-Attention module
-class CasualSelfAttention(nn.Module):
+class CausalSelfAttention(nn.Module):
     
     def __init__(self, config):
         super().__init__()
@@ -76,7 +76,7 @@ class Block(nn.Module):
         # Layer normalization before the attention mechanism
         self.ln_1 = nn.LayerNorm(config.n_embd)
         # Causal self-attention mechanism
-        self.attn = CasualSelfAttention(config)
+        self.attn = CausalSelfAttention(config)
         # Layer normalization before the MLP
         self.ln_2 = nn.LayerNorm(config.n_embd)
         # Multi-layer perceptron
