@@ -66,7 +66,7 @@ The entire GPT-2 implementation is contained in a single file with the following
 **Generation Code (currently disabled):**
 - Top-k sampling implementation (k=50)
 - Temperature-based generation via softmax
-- Located after `sys.exit(0)` on line 292
+- Located after `sys.exit(0)`
 
 ### Data Requirements
 
@@ -78,7 +78,7 @@ The training script expects:
 
 1. **Weight initialization**: The `_init_weights` method applies custom scaling to layers marked with `NANOGPT_SCALE_INIT` attribute
 2. **Forward pass**: Model returns `(logits, loss)` tuple when targets provided, just `logits` otherwise (though generation code expects single return)
-3. **Training state**: Current script trains for 50 steps then exits (line 292: `sys.exit(0)`)
+3. **Training state**: Current script trains for 50 steps then exits (with`sys.exit(0)`)
 
 ### Testing
 

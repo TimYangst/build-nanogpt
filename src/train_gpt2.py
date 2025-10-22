@@ -1,340 +1,539 @@
+"""
+GPT-2 Implementation from Scratch
+
+This module implements a GPT-2 style transformer language model in PyTorch.
+Includes model architecture, weight initialization, pre-trained model loading,
+training loop, and text generation.
+
+Architecture:
+    - Token and positional embeddings
+    - Stack of transformer blocks (multi-head attention + MLP)
+    - Language modeling head with weight tying
+
+Key Features:
+    - Causal self-attention for autoregressive generation
+    - Pre-normalization (LayerNorm before sub-layers)
+    - Custom weight initialization with residual scaling
+    - Compatible with HuggingFace GPT-2 pre-trained weights
+"""
+
 from dataclasses import dataclass
 import math
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-# Causal Self-Attention module
+
+# ============================================================================
+# Causal Self-Attention Module
+# ============================================================================
+# Multi-head causal self-attention with masking for autoregressive generation.
+# Implements the standard scaled dot-product attention mechanism with a causal
+# mask to prevent attending to future positions in the sequence.
+
 class CausalSelfAttention(nn.Module):
-    
+
     def __init__(self, config):
         super().__init__()
-        # Ensure embedding dimension is divisible by the number of heads
+        # Validate that embedding dimension is evenly divisible by number of heads
         assert config.n_embd % config.n_head == 0
-        # Linear layer to project input to query, key, and value matrices
+
+        # Combined linear projection for query, key, and value (more efficient than separate layers)
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
-        # Linear layer to project the output of the attention mechanism
+
+        # Output projection layer
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        # Mark for scaled initialization (std = (2 * n_layer)^-0.5)
         self.c_proj.NANOGPT_SCALE_INIT = 1
-        # Number of attention heads
+
+        # Store attention configuration
         self.n_head = config.n_head
-        # Embedding dimension
         self.n_embd = config.n_embd
-        # Causal mask to ensure that attention is only applied to the left in the input sequence
+
+        # Register causal mask as a buffer (not a trainable parameter)
+        # Lower triangular matrix ensures position i can only attend to positions <= i
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                      .view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x):
-        # Get input dimensions: Batch size, Time steps, Embedding size (n_embd)
+        # Input shape: (B, T, C) where B=batch, T=sequence length, C=n_embd
         B, T, C = x.size()
-        # Compute query, key, value matrices in a single pass
-        qkv = self.c_attn(x)
-        # Split the qkv matrix into query, key, and value matrices
-        q, k, v = qkv.split(self.n_embd, dim=2)
-        # Reshape and transpose query, key, and value for multi-head attention
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-        # Compute attention scores
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        # Apply causal mask to the attention scores
+
+        # Step 1: Compute Q, K, V in a single matrix multiplication
+        qkv = self.c_attn(x)  # (B, T, 3*C)
+        q, k, v = qkv.split(self.n_embd, dim=2)  # Each: (B, T, C)
+
+        # Step 2: Reshape for multi-head attention
+        # Split embedding dimension across heads: C = n_head * head_size
+        # Transpose to get heads dimension before sequence dimension
+        head_size = C // self.n_head
+        k = k.view(B, T, self.n_head, head_size).transpose(1, 2)  # (B, n_head, T, head_size)
+        q = q.view(B, T, self.n_head, head_size).transpose(1, 2)  # (B, n_head, T, head_size)
+        v = v.view(B, T, self.n_head, head_size).transpose(1, 2)  # (B, n_head, T, head_size)
+
+        # Step 3: Compute scaled dot-product attention scores
+        # Scale by 1/sqrt(d_k) to prevent softmax saturation
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))  # (B, n_head, T, T)
+
+        # Step 4: Apply causal mask (set future positions to -inf before softmax)
         att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-        # Apply softmax to get attention weights
-        att = F.softmax(att, dim=-1)
-        # Compute the output of the attention mechanism
-        y = att @ v  # (B, nh, T, hs)
-        # Reshape and transpose the output
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        # Project the output to the final embedding dimension
+
+        # Step 5: Normalize attention scores to get attention weights
+        att = F.softmax(att, dim=-1)  # (B, n_head, T, T)
+
+        # Step 6: Apply attention weights to values
+        y = att @ v  # (B, n_head, T, head_size)
+
+        # Step 7: Reassemble all head outputs
+        y = y.transpose(1, 2).contiguous().view(B, T, C)  # (B, T, C)
+
+        # Step 8: Final output projection
         y = self.c_proj(y)
         return y
 
-# Multi-Layer Perceptron module
+# ============================================================================
+# Multi-Layer Perceptron (MLP) Module
+# ============================================================================
+# Position-wise feed-forward network applied after attention in each transformer block.
+# Uses a 4x expansion ratio (hidden dimension = 4 * n_embd) following GPT-2 architecture.
+
 class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        # Linear layer to project input to a higher dimension
+        # Expansion layer: project from n_embd to 4*n_embd
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
-        # GELU activation function
+
+        # GELU activation with tanh approximation (matches GPT-2 implementation)
         self.gelu = nn.GELU(approximate='tanh')
-        # Linear layer to project the output back to the original dimension
+
+        # Projection layer: project back from 4*n_embd to n_embd
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        # Mark for scaled initialization (std = (2 * n_layer)^-0.5)
         self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
-        # Forward pass through the MLP
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
+        # MLP forward pass: Linear -> GELU -> Linear
+        # Input/Output shape: (B, T, n_embd)
+        x = self.c_fc(x)      # (B, T, 4*n_embd)
+        x = self.gelu(x)      # (B, T, 4*n_embd)
+        x = self.c_proj(x)    # (B, T, n_embd)
         return x
 
-# Transformer Block module
+# ============================================================================
+# Transformer Block Module
+# ============================================================================
+# Single transformer layer combining multi-head attention and feed-forward network.
+# Uses pre-normalization (LayerNorm before sub-layers) and residual connections.
+
 class Block(nn.Module):
+
     def __init__(self, config):
         super().__init__()
-        # Layer normalization before the attention mechanism
+        # Layer normalization applied before attention (pre-norm architecture)
         self.ln_1 = nn.LayerNorm(config.n_embd)
-        # Causal self-attention mechanism
+
+        # Multi-head causal self-attention
         self.attn = CausalSelfAttention(config)
-        # Layer normalization before the MLP
+
+        # Layer normalization applied before MLP (pre-norm architecture)
         self.ln_2 = nn.LayerNorm(config.n_embd)
-        # Multi-layer perceptron
+
+        # Position-wise feed-forward network
         self.mlp = MLP(config)
 
     def forward(self, x):
-        # Forward pass through the transformer block with residual connections
+        # Transformer block with residual connections:
+        # x = x + Attention(LayerNorm(x))
+        # x = x + MLP(LayerNorm(x))
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
 
-# GPT model configuration
+# ============================================================================
+# GPT Model Configuration
+# ============================================================================
+# Dataclass storing hyperparameters for the GPT model architecture.
+
 @dataclass
 class GPTConfig:
-    block_size: int = 1024    # Maximum sequence length
-    vocab_size: int = 50257   # Number of tokens in the vocabulary
-    n_layer: int = 12          # Number of transformer blocks
-    n_head: int = 12           # Number of attention heads
-    n_embd: int = 768         # Embedding dimension
+    block_size: int = 1024    # Maximum sequence length (context window)
+    vocab_size: int = 50257   # Number of tokens (GPT-2 BPE vocabulary size)
+    n_layer: int = 12         # Number of transformer blocks (depth)
+    n_head: int = 12          # Number of attention heads per block
+    n_embd: int = 768         # Embedding dimension (model width)
 
-# GPT model
+
+# ============================================================================
+# GPT Model
+# ============================================================================
+# Full GPT-2 style language model with token/positional embeddings,
+# transformer blocks, and language modeling head.
+
 class GPT(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         self.config = config
-        # Transformer module dictionary
+
+        # Define all transformer components in a ModuleDict
         self.transformer = nn.ModuleDict(dict(
-            # Token embedding layer
+            # Token embedding: maps token IDs to embedding vectors
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            # Positional embedding layer
+
+            # Positional embedding: learned position encodings
             wpe = nn.Embedding(config.block_size, config.n_embd),
-            # List of transformer blocks
+
+            # Stack of transformer blocks
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            # Final layer normalization
+
+            # Final layer normalization applied before output projection
             ln_f = nn.LayerNorm(config.n_embd)
         ))
-        # Language model head to project the output to the vocabulary size
+
+        # Language model head: projects hidden states to vocabulary logits
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-        # weight sharing between token embedding and language model head
+        # Weight tying: share weights between token embedding and output projection
+        # This reduces parameters and improves performance
         self.transformer.wte.weight = self.lm_head.weight
 
+        # Initialize all weights
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
-        # Initialize weights for linear and embedding layers
+        """
+        Initialize weights for all layers in the model.
+        Uses GPT-2 initialization scheme with special scaling for residual projections.
+        """
         if isinstance(module, nn.Linear):
+            # Default standard deviation for linear layers
             std = 0.02
+
+            # Special scaled initialization for residual projection layers
+            # Marked with NANOGPT_SCALE_INIT attribute (c_proj in attention and MLP)
+            # Scale by 1/sqrt(2*n_layer) to account for residual path accumulation
             if hasattr(module, 'NANOGPT_SCALE_INIT'):
                 std = (2.0 * self.config.n_layer) ** -0.5
+
+            # Initialize weights from normal distribution
             torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+
+            # Zero-initialize biases if present
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
-        # Initialize weights for embedding layers
+
         elif isinstance(module, nn.Embedding):
+            # Initialize embedding weights from normal distribution
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
-        # Get input dimensions: Batch size, Time steps
-        B, T = idx.size()
-        # Ensure the input sequence length does not exceed the block size
-        assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, model block size is exhausted."
+        """
+        Forward pass through the GPT model.
 
-        # Create token and positional embeddings
+        Args:
+            idx: Input token indices, shape (B, T) where B=batch, T=sequence length
+            targets: Optional target token indices for computing loss, shape (B, T)
+
+        Returns:
+            logits: Predicted logits for each position, shape (B, T, vocab_size)
+            loss: Cross-entropy loss if targets provided, otherwise None
+        """
+        # Input shape: (B, T)
+        B, T = idx.size()
+
+        # Validate sequence length doesn't exceed model's context window
+        assert T <= self.config.block_size, \
+            f"Sequence length {T} exceeds block size {self.config.block_size}"
+
+        # Step 1: Create embeddings
         token_embeddings = self.transformer.wte(idx)  # (B, T, n_embd)
         position_ids = torch.arange(0, T, dtype=torch.long, device=idx.device)  # (T,)
         position_embeddings = self.transformer.wpe(position_ids)  # (T, n_embd)
 
-        # Combine token and positional embeddings
+        # Step 2: Combine token and position information
         x = token_embeddings + position_embeddings  # (B, T, n_embd)
 
-        # Forward pass through each transformer block
+        # Step 3: Pass through all transformer blocks
         for block in self.transformer.h:
-            x = block(x)
+            x = block(x)  # (B, T, n_embd)
 
-        # Final layer normalization
+        # Step 4: Apply final layer normalization
         x = self.transformer.ln_f(x)  # (B, T, n_embd)
 
-        loss = None
-         # Language model head to get logits for each token in the vocabulary
+        # Step 5: Project to vocabulary space to get logits
         logits = self.lm_head(x)  # (B, T, vocab_size)
 
+        # Step 6: Compute loss if targets are provided
+        loss = None
         if targets is not None:
+            # Flatten batch and sequence dimensions for cross-entropy
+            # Shape: (B*T, vocab_size) and (B*T,)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
 
         return logits, loss
        
     @classmethod
     def from_pretrained(cls, model_type):
-        """Load a pre-trained GPT model"""
-        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}, "Unsupported model type"
+        """
+        Load pre-trained GPT-2 weights from HuggingFace transformers library.
+
+        Args:
+            model_type: One of 'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'
+
+        Returns:
+            GPT model initialized with pre-trained weights
+
+        Note:
+            Handles weight transposition for attention/MLP projection layers due to
+            different weight matrix conventions between HuggingFace and this implementation.
+        """
+        # Validate model type
+        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}, \
+            f"Unsupported model type: {model_type}"
+
         from transformers import GPT2LMHeadModel
         print(f"Loading pre-trained model: {model_type}")
 
-        # Create a model configuration based on the model type
+        # Step 1: Create model configuration matching the requested model size
         config_args = {
-            'gpt2': dict(n_layer=12, n_head=12, n_embd=768),
-            'gpt2-medium': dict(n_layer=24, n_head=16, n_embd=1024),
-            'gpt2-large': dict(n_layer=36, n_head=20, n_embd=1280),
-            'gpt2-xl': dict(n_layer=48, n_head=25, n_embd=1600),
+            'gpt2':        dict(n_layer=12, n_head=12, n_embd=768),   # 117M params
+            'gpt2-medium': dict(n_layer=24, n_head=16, n_embd=1024),  # 345M params
+            'gpt2-large':  dict(n_layer=36, n_head=20, n_embd=1280),  # 774M params
+            'gpt2-xl':     dict(n_layer=48, n_head=25, n_embd=1600),  # 1558M params
         }[model_type]
 
-        # Set the vocabulary size and block size
+        # Add vocabulary and context window size (same for all GPT-2 variants)
         config_args['vocab_size'] = 50257
         config_args['block_size'] = 1024
 
-        # Create a new model with the specified configuration
+        # Step 2: Initialize our model with random weights
         config = GPTConfig(**config_args)
         model = GPT(config)
-
-        # Get the state dictionary of the new model
         sd = model.state_dict()
-        sd_keys = set(sd.keys())
-        # Remove the attention bias key from the state dictionary keys
-        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')]
 
-        # Load the pre-trained model from Hugging Face
+        # Get our model's parameter names (excluding attention bias buffer)
+        sd_keys = [k for k in sd.keys() if not k.endswith('.attn.bias')]
+
+        # Step 3: Load pre-trained weights from HuggingFace
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
-        # Get the state dictionary of the pre-trained model
         sd_hf = model_hf.state_dict()
 
-        # Get the keys from the pre-trained model's state dictionary
-        sd_keys_hf = sd_hf.keys()
-        # Remove the masked bias and bias keys from the pre-trained model's state dictionary keys
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')]
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')]
+        # Get HuggingFace model's parameter names (excluding buffers we don't use)
+        sd_keys_hf = [k for k in sd_hf.keys()
+                      if not k.endswith('.attn.masked_bias')  # HF-specific buffer
+                      and not k.endswith('.attn.bias')]        # Attention mask buffer
 
-        # These weights need to be transposed
-        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+        # Step 4: Validate parameter counts match
+        assert len(sd_keys) == len(sd_keys_hf), \
+            f"Parameter count mismatch: {len(sd_keys)} != {len(sd_keys_hf)}"
 
-        # Ensure the number of keys in both state dictionaries is the same
-        assert len(sd_keys) == len(sd_keys_hf), f"State dict keys do not match in length: {len(sd_keys)} != {len(sd_keys_hf)}"
+        # Step 5: Copy weights from HuggingFace model to our model
+        # Some weights need to be transposed due to different Conv1D vs Linear conventions
+        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight',
+                      'mlp.c_fc.weight', 'mlp.c_proj.weight']
 
-        # Copy the weights from the pre-trained model to the new model
         for k in sd_keys_hf:
-          if any(k.endswith(w) for w in transposed):
-              # Transpose the weights if necessary
-              assert sd[k].shape[::-1] == sd_hf[k].shape, f"Shape mismatch for {k}"
-              with torch.no_grad():
-                  sd[k].copy_(sd_hf[k].t())
-          else:
-              # Copy the weights directly
-              assert sd_hf[k].shape == sd[k].shape, f"Shape mismatch for {k}"
-              with torch.no_grad():
-                  sd[k].copy_(sd_hf[k])
+            if any(k.endswith(w) for w in transposed):
+                # HuggingFace uses Conv1D which stores weights transposed
+                assert sd[k].shape[::-1] == sd_hf[k].shape, \
+                    f"Shape mismatch for {k}: {sd[k].shape} vs {sd_hf[k].shape}"
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k].t())
+            else:
+                # Direct copy for embeddings, layer norms, etc.
+                assert sd[k].shape == sd_hf[k].shape, \
+                    f"Shape mismatch for {k}: {sd[k].shape} vs {sd_hf[k].shape}"
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k])
 
         return model
-    
-# Auto detect device
+
+
+# ============================================================================
+# Device Configuration
+# ============================================================================
+# Auto-detect best available device: CUDA GPU > Apple Silicon MPS > CPU
+
 device = 'cpu'
 if torch.cuda.is_available():
     device = 'cuda'
-elif torch.backends.mps.is_available() and torch.backends.mps.is_available():
+elif torch.backends.mps.is_available():
     device = 'mps'
-# device = 'cpu'  # Force CPU for this example
 print(f"Using device: {device}")
+
+
+# ============================================================================
+# Data Loader
+# ============================================================================
 
 import tiktoken
 
+
 class DataLoaderLite:
+    """
+    Lightweight data loader for language modeling.
+    Loads text from a file, tokenizes it, and yields batches for training.
+    """
+
     def __init__(self, B, T):
+        """
+        Initialize the data loader.
+
+        Args:
+            B: Batch size (number of sequences per batch)
+            T: Sequence length (number of tokens per sequence)
+        """
         self.B = B
         self.T = T
         self.current_pos = 0
 
+        # Load and tokenize the training data
         with open("data/input.txt", "r") as f:
             text = f.read()
+
+        # Use GPT-2 BPE tokenizer
         enc = tiktoken.get_encoding("gpt2")
         tokens = enc.encode(text)
         self.tokens = torch.tensor(tokens)
+
         print(f"Loaded {len(self.tokens)} tokens.")
-        print(f" 1 epoch = {len(self.tokens) // (B * T)} batches.")
+        print(f"1 epoch = {len(self.tokens) // (B * T)} batches.")
 
     def next_batch(self):
+        """
+        Get the next batch of data.
+
+        Returns:
+            x: Input sequences, shape (B, T)
+            y: Target sequences (shifted by 1), shape (B, T)
+        """
         B, T = self.B, self.T
+
+        # Extract chunk of B*T+1 tokens (extra token for target shift)
         buf = self.tokens[self.current_pos : self.current_pos + B * T + 1]
+
+        # Input: tokens 0 to B*T-1
         x = buf[:-1].view(B, T)
+        # Target: tokens 1 to B*T (shifted by 1 for next-token prediction)
         y = buf[1:].view(B, T)
+
+        # Advance position for next batch
         self.current_pos += B * T
+
+        # Loop back to beginning when reaching end of data
         if self.current_pos + B * T >= len(self.tokens):
             self.current_pos = 0
+
         return x, y
-    
+
+
+# ============================================================================
+# Training Setup
+# ============================================================================
+
+# Set random seeds for reproducibility
 torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
-   
+
+# Initialize data loader
+# B=4: batch size, T=32: sequence length
 train_loader = DataLoaderLite(B=4, T=32)
 
-# Load the pre-trained GPT-2 model
+# Initialize model
+# Option 1: Load pre-trained GPT-2 weights
 # model = GPT.from_pretrained('gpt2')
-# print("Loaded pre-trained GPT-2 model successfully.")
 
-# Alternatively, create a new GPT model with default configuration
+# Option 2: Train from scratch with random initialization
 model = GPT(GPTConfig())
 model = model.to(device)
-# logits, loss = model(x, y)
 
+# Initialize optimizer
+# Using AdamW with learning rate 3e-4 (common for small GPT models)
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+
+# ============================================================================
+# Training Loop
+# ============================================================================
+
 for steps in range(50):
+    # Get next batch of data
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
+
+    # Forward pass: compute predictions and loss
     logits, loss = model(x, y)
+
+    # Backward pass: compute gradients
     optimizer.zero_grad()
     loss.backward()
+
+    # Update weights
     optimizer.step()
+
+    # Log training progress
     print(f"Step {steps}, Loss: {loss.item()}")
 
-# print("Logits shape:", logits.shape)  # Expected shape: (B, T, vocab_size)
-# print("Loss:", loss)
-
+# Training complete - exit before generation code
 import sys; sys.exit(0)
-# Set the model to evaluation mode and move it to the specified device
+
+
+# ============================================================================
+# Text Generation (Disabled - exits before reaching this code)
+# ============================================================================
+
+# Prepare model for inference
 model.eval()
 model.to(device)
 
-# Set the number of sequences to generate and the maximum length of each sequence
-num_return_squences = 5
-max_length = 30
+# Generation parameters
+num_return_squences = 5  # Number of different sequences to generate
+max_length = 30          # Maximum length of each generated sequence
 
-
-
-# Import the tiktoken library for encoding and decoding text
+# Prepare prompt
 import tiktoken
 enc = tiktoken.get_encoding("gpt2")
-# Encode the input text into tokens
-tokens = enc.encode("Hello, I'm a language model,")
+
+# Encode the prompt text
+prompt = "Hello, I'm a language model,"
+tokens = enc.encode(prompt)
 tokens = torch.tensor(tokens, dtype=torch.long)
-# Reshape the tokens tensor to have a batch dimension and repeat it for the number of return sequences
-tokens = tokens.unsqueeze(0).repeat(num_return_squences, 1)
+
+# Create batch: repeat the prompt for each sequence we want to generate
+tokens = tokens.unsqueeze(0).repeat(num_return_squences, 1)  # (num_sequences, prompt_length)
 x = tokens.to(device)
 
-# Set the random seed for reproducibility
+# Set random seed for reproducible generation
 torch.manual_seed(42)
 if device == 'cuda':
     torch.cuda.manual_seed(42)
 
-# Generate tokens until the sequence length reaches the maximum length
+# Autoregressive generation loop
+# Generate one token at a time until reaching max_length
 while x.size(1) < max_length:
-    # Disable gradient calculation for inference
-    with torch.no_grad():
-        # Get the logits from the model
-        logits = model(x)
-        # Get the logits for the last token in the sequence
-        logits = logits[:, -1, :]
-        # Convert the logits to probabilities using softmax
-        probs = F.softmax(logits, dim=-1)
-        # Get the top-k probabilities and indices from the distribution
-        tokprobs, topk_indices = torch.topk(probs, k=50, dim=-1)
-        # Sample the next token from the top-k probabilities
-        ix = torch.multinomial(tokprobs, num_samples=1)
-        # Gather the sampled token indices
-        xcol = torch.gather(topk_indices, -1, ix)
-        # Append the new token to the sequence
-        x = torch.cat((x, xcol), dim=1)
+    with torch.no_grad():  # Disable gradient computation for inference
+        # Step 1: Get model predictions
+        logits = model(x)           # (B, current_length, vocab_size)
+        logits = logits[:, -1, :]   # Only use logits for last position: (B, vocab_size)
 
-# Decode and print the generated sequences
+        # Step 2: Convert logits to probabilities
+        probs = F.softmax(logits, dim=-1)  # (B, vocab_size)
+
+        # Step 3: Top-k sampling (sample from top 50 most likely tokens)
+        topk_probs, topk_indices = torch.topk(probs, k=50, dim=-1)  # (B, 50)
+
+        # Step 4: Sample one token from the top-k distribution
+        ix = torch.multinomial(topk_probs, num_samples=1)  # (B, 1)
+
+        # Step 5: Map sampled index back to actual token ID
+        xcol = torch.gather(topk_indices, -1, ix)  # (B, 1)
+
+        # Step 6: Append new token to sequence
+        x = torch.cat((x, xcol), dim=1)  # (B, current_length + 1)
+
+# Decode and display generated sequences
 for i in range(num_return_squences):
     tokens = x[i, :max_length].tolist()
     decoded = enc.decode(tokens)
