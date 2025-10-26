@@ -453,6 +453,7 @@ torch.backends.cudnn.conv.fp32_precision = 'tf32'
 # Option 2: Train from scratch with random initialization
 model = GPT(GPTConfig())
 model = model.to(device)
+model = torch.compile(model) if torch.__version__ >= "2.0.0" else model
 
 # Initialize optimizer
 # Using AdamW with learning rate 3e-4 (common for small GPT models)
