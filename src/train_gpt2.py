@@ -441,7 +441,7 @@ if torch.cuda.is_available():
 
 # Initialize data loader
 # B=4: batch size, T=32: sequence length
-train_loader = DataLoaderLite(B=8, T=1024)
+train_loader = DataLoaderLite(B=32, T=1024)
 
 # Configure TF32 precision using new API (PyTorch 2.9+)
 torch.backends.cuda.matmul.fp32_precision = 'tf32'
@@ -452,7 +452,7 @@ torch.backends.cudnn.conv.fp32_precision = 'tf32'
 # model = GPT.from_pretrained('gpt2')
 
 # Option 2: Train from scratch with random initialization
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304))
 model = model.to(device)
 model = torch.compile(model) if torch.__version__ >= "2.0.0" else model
 
