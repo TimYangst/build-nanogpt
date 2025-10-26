@@ -71,18 +71,19 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, head_size).transpose(1, 2)  # (B, n_head, T, head_size)
         v = v.view(B, T, self.n_head, head_size).transpose(1, 2)  # (B, n_head, T, head_size)
 
-        # Step 3: Compute scaled dot-product attention scores
-        # Scale by 1/sqrt(d_k) to prevent softmax saturation
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))  # (B, n_head, T, T)
+        # # Step 3: Compute scaled dot-product attention scores
+        # # Scale by 1/sqrt(d_k) to prevent softmax saturation
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))  # (B, n_head, T, T)
 
-        # Step 4: Apply causal mask (set future positions to -inf before softmax)
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+        # # Step 4: Apply causal mask (set future positions to -inf before softmax)
+        # att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
 
-        # Step 5: Normalize attention scores to get attention weights
-        att = F.softmax(att, dim=-1)  # (B, n_head, T, T)
+        # # Step 5: Normalize attention scores to get attention weights
+        # att = F.softmax(att, dim=-1)  # (B, n_head, T, T)
 
-        # Step 6: Apply attention weights to values
-        y = att @ v  # (B, n_head, T, head_size)
+        # # Step 6: Apply attention weights to values
+        # y = att @ v  # (B, n_head, T, head_size)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
         # Step 7: Reassemble all head outputs
         y = y.transpose(1, 2).contiguous().view(B, T, C)  # (B, T, C)
