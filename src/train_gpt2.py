@@ -469,11 +469,13 @@ for steps in range(50):
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
 
-    # Forward pass: compute predictions and loss
-    logits, loss = model(x, y)
-
     # Backward pass: compute gradients
     optimizer.zero_grad()
+
+    with torch.autocast(device_type=device, dtype=torch.bfloat16 if device == 'cuda' else torch.float32):
+        # Forward pass: compute predictions and loss
+        logits, loss = model(x, y)
+        # import code; code.interact(local=locals())
 
     loss.backward()
 
