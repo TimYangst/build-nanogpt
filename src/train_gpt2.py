@@ -18,6 +18,7 @@ Key Features:
 """
 
 from dataclasses import dataclass
+import inspect
 import math
 import torch
 import torch.nn as nn
@@ -350,6 +351,26 @@ class GPT(nn.Module):
 
         return model
 
+    def configure_optimizer(self, weight_decay, learning_rate, device):
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0},
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decay params tensors: {len(decay_params)}, total size: {num_decay_params:,} parameters")
+        print(f"num no decay params tensors: {len(nodecay_params)}, total size: {num_nodecay_params:,} parameters")
+
+        fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device == 'cuda'
+        print(f"Using fused AdamW: {use_fused} (fused available: {fused_available}, device: {device})")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        return optimizer
 
 # ============================================================================
 # Device Configuration
@@ -456,7 +477,7 @@ model = GPT(GPTConfig(vocab_size=50304))
 model = model.to(device)
 model = torch.compile(model) if torch.__version__ >= "2.0.0" else model
 
-max_lr = 3e-4
+max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 10
 max_steps = 50
@@ -474,8 +495,11 @@ def get_lr(step):
 
 
 # Initialize optimizer
-# Using AdamW with learning rate 3e-4 (common for small GPT models)
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+optimizer = model.configure_optimizer(
+    weight_decay=0.1,
+    learning_rate=max_lr,
+    device=device
+)
 
 
 # ============================================================================
