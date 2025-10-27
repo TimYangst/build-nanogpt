@@ -456,6 +456,23 @@ model = GPT(GPTConfig(vocab_size=50304))
 model = model.to(device)
 model = torch.compile(model) if torch.__version__ >= "2.0.0" else model
 
+max_lr = 3e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
+def get_lr(step):
+    if step < warmup_steps:
+        return max_lr * (step+1) / warmup_steps
+    
+    if step >= max_steps:
+        return min_lr
+    
+    decay_ratio = (step - warmup_steps) / (max_steps - warmup_steps)
+    assert 0.0 <= decay_ratio <= 1.0
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_lr + coeff * (max_lr - min_lr)   
+
+
 # Initialize optimizer
 # Using AdamW with learning rate 3e-4 (common for small GPT models)
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
@@ -482,6 +499,9 @@ for steps in range(50):
     loss.backward()
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
+    lr = get_lr(steps)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
     # Update weights
     optimizer.step()
 
@@ -492,7 +512,7 @@ for steps in range(50):
     tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
 
     # Log training progress
-    print(f"Step {steps}, Loss: {loss.item()}, norm: {norm:.4f}, Time per batch: {dt:.2f} ms, tokens/sec: {tokens_per_sec:.2f}")
+    print(f"Step {steps:4d}, Loss: {loss.item():.6f}, norm: {norm:.4f}, Time per batch: {dt:.2f} ms, tokens/sec: {tokens_per_sec:.2f}")
 
 # Training complete - exit before generation code
 import sys; sys.exit(0)
