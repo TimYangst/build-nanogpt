@@ -22,7 +22,9 @@ import inspect
 import math
 import os
 import torch
+import torch.distributed as dist
 import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn import functional as F
 
 
@@ -368,7 +370,7 @@ class GPT(nn.Module):
         print(f"num no decay params tensors: {len(nodecay_params)}, total size: {num_nodecay_params:,} parameters")
 
         fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device == 'cuda'
+        use_fused = fused_available
         print(f"Using fused AdamW: {use_fused} (fused available: {fused_available}, device: {device})")
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
         return optimizer
@@ -388,7 +390,7 @@ class DataLoaderLite:
     Loads text from a file, tokenizes it, and yields batches for training.
     """
 
-    def __init__(self, B, T):
+    def __init__(self, B, T, process_rank=0, num_processes=1):
         """
         Initialize the data loader.
 
@@ -397,8 +399,9 @@ class DataLoaderLite:
             T: Sequence length (number of tokens per sequence)
         """
         self.B = B
-        self.T = T
-        self.current_pos = 0
+        self.T = T  
+        self.process_rank = process_rank
+        self.num_processes = num_processes
 
         # Load and tokenize the training data
         with open("data/input.txt", "r") as f:
@@ -410,7 +413,8 @@ class DataLoaderLite:
         self.tokens = torch.tensor(tokens)
 
         print(f"Loaded {len(self.tokens)} tokens.")
-        print(f"1 epoch = {len(self.tokens) // (B * T)} batches.")
+        
+        self.current_pos = self.B * self.T * self.process_rank
 
     def next_batch(self):
         """
@@ -431,11 +435,11 @@ class DataLoaderLite:
         y = buf[1:].view(B, T)
 
         # Advance position for next batch
-        self.current_pos += B * T
+        self.current_pos += B * T * self.num_processes
 
         # Loop back to beginning when reaching end of data
-        if self.current_pos + B * T >= len(self.tokens):
-            self.current_pos = 0
+        if self.current_pos + B * T * self.num_processes >= len(self.tokens):
+            self.current_pos = self.B * self.T * self.process_rank
 
         return x, y
 
@@ -478,7 +482,7 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
 total_batch_size = 524288  # Total tokens per batch (B * T)
-B = 16 # micro-batch size
+B = 32 # micro-batch size
 T = 1024
 assert total_batch_size % (B * T * ddp_world_size) == 0
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
@@ -486,23 +490,23 @@ if master_process:
     print("Total batch size (tokens per batch):", total_batch_size)
     print(f"Using batch size B={B}, sequence length T={T}, grad_accum_steps={grad_accum_steps}")
         
-print("I'm GPU: ", ddp_rank)
-print("Using device: ", device)
-print("Is master process: ", master_process)
-print("Exiting before training loop for testing purposes.")
+# print("I'm GPU: ", ddp_rank)
+# print("Using device: ", device)
+# print("Is master process: ", master_process)
+# print("Exiting before training loop for testing purposes.")
 
-destroy_process_group() if ddp else None
+# destroy_process_group() if ddp else None
 
-# $ torchrun --standalone --nproc_per_node=1  src/train_gpt2.py
-import sys; sys.exit(0)
+# # $ torchrun --standalone --nproc_per_node=1  src/train_gpt2.py
+# import sys; sys.exit(0)
 
 # Initialize data loader
 # B=4: batch size, T=32: sequence length
-train_loader = DataLoaderLite(B=B, T=T)
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)
 
-# Configure TF32 precision using new API (PyTorch 2.9+)
-torch.backends.cuda.matmul.fp32_precision = 'tf32'
-torch.backends.cudnn.conv.fp32_precision = 'tf32'
+# Configure TF32 precision using legacy API (compatible with torch.compile)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 # Initialize model
 # Option 1: Load pre-trained GPT-2 weights
@@ -512,6 +516,9 @@ torch.backends.cudnn.conv.fp32_precision = 'tf32'
 model = GPT(GPTConfig(vocab_size=50304))
 model = model.to(device)
 model = torch.compile(model) if torch.__version__ >= "2.0.0" else model
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module if ddp else model
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
@@ -531,7 +538,7 @@ def get_lr(step):
 
 
 # Initialize optimizer
-optimizer = model.configure_optimizer(
+optimizer = raw_model.configure_optimizer(
     weight_decay=0.1,
     learning_rate=max_lr,
     device=device
@@ -551,13 +558,18 @@ for steps in range(50):
     for micro_step in range(grad_accum_steps):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
-        with torch.autocast(device_type=device, dtype=torch.bfloat16 if device == 'cuda' else torch.float32):
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
             # Forward pass: compute predictions and loss
             logits, loss = model(x, y)
             # import code; code.interact(local=locals())
         loss = loss / grad_accum_steps
         loss_accum += loss.detach()
+        if ddp:
+            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
         loss.backward()
+
+    if ddp:
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
         
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
@@ -567,14 +579,20 @@ for steps in range(50):
     # Update weights
     optimizer.step()
 
-    torch.cuda.synchronize() if device == 'cuda' else None
+    torch.cuda.synchronize()
 
     t1 = time.time()
-    dt = (t1 - t0) * 1000
-    tokens_per_sec = (train_loader.B * train_loader.T * grad_accum_steps) / (t1 - t0)
+    dt = t1 - t0
+    token_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
+    tokens_per_sec = token_processed / dt
 
     # Log training progress
-    print(f"Step {steps:4d}, Loss: {loss_accum.item():.6f}, norm: {norm:.4f}, Time per batch: {dt:.2f} ms, tokens/sec: {tokens_per_sec:.2f}")
+    if master_process:
+        print(f"Step {steps:4d}, Loss: {loss_accum.item():.6f}, norm: {norm:.4f}, Time per batch: {dt * 1000:.2f} ms, tokens/sec: {tokens_per_sec:.2f}")
+
+if ddp:
+    destroy_process_group()
+
 
 # Training complete - exit before generation code
 import sys; sys.exit(0)
