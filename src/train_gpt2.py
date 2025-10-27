@@ -20,6 +20,7 @@ Key Features:
 from dataclasses import dataclass
 import inspect
 import math
+import os
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -372,17 +373,6 @@ class GPT(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
         return optimizer
 
-# ============================================================================
-# Device Configuration
-# ============================================================================
-# Auto-detect best available device: CUDA GPU > Apple Silicon MPS > CPU
-
-device = 'cpu'
-if torch.cuda.is_available():
-    device = 'cuda'
-elif torch.backends.mps.is_available():
-    device = 'mps'
-print(f"Using device: {device}")
 
 
 # ============================================================================
@@ -450,6 +440,33 @@ class DataLoaderLite:
         return x, y
 
 
+
+from torch.distributed import init_process_group, destroy_process_group
+
+ddp = int(os.environ.get("RANK", -1)) != -1
+if ddp:
+    assert torch.cuda.is_available(), "DDP mode requires CUDA"
+    init_process_group(backend="nccl")
+    ddp_rank = int(os.environ["RANK"])
+    ddp_local_rank = int(os.environ["LOCAL_RANK"])
+    ddp_world_size = int(os.environ["WORLD_SIZE"])
+    device = f"cuda:{ddp_local_rank}"
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0
+else:
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    device = 'cpu'
+    if torch.cuda.is_available():
+        device = 'cuda'
+    elif torch.backends.mps.is_available():
+        device = 'mps'
+    print(f"Using device: {device}")
+
+
+
 # ============================================================================
 # Training Setup
 # ============================================================================
@@ -461,12 +478,23 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
 total_batch_size = 524288  # Total tokens per batch (B * T)
-B = 32 # micro-batch size
+B = 16 # micro-batch size
 T = 1024
-assert total_batch_size % (B * T) == 0
-grad_accum_steps = total_batch_size // (B * T)
-print("Total batch size (tokens per batch):", total_batch_size)
-print(f"Using batch size B={B}, sequence length T={T}, grad_accum_steps={grad_accum_steps}")
+assert total_batch_size % (B * T * ddp_world_size) == 0
+grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
+if master_process:
+    print("Total batch size (tokens per batch):", total_batch_size)
+    print(f"Using batch size B={B}, sequence length T={T}, grad_accum_steps={grad_accum_steps}")
+        
+print("I'm GPU: ", ddp_rank)
+print("Using device: ", device)
+print("Is master process: ", master_process)
+print("Exiting before training loop for testing purposes.")
+
+destroy_process_group() if ddp else None
+
+# $ torchrun --standalone --nproc_per_node=1  src/train_gpt2.py
+import sys; sys.exit(0)
 
 # Initialize data loader
 # B=4: batch size, T=32: sequence length
