@@ -460,9 +460,17 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
+total_batch_size = 524288  # Total tokens per batch (B * T)
+B = 32 # micro-batch size
+T = 1024
+assert total_batch_size % (B * T) == 0
+grad_accum_steps = total_batch_size // (B * T)
+print("Total batch size (tokens per batch):", total_batch_size)
+print(f"Using batch size B={B}, sequence length T={T}, grad_accum_steps={grad_accum_steps}")
+
 # Initialize data loader
 # B=4: batch size, T=32: sequence length
-train_loader = DataLoaderLite(B=32, T=1024)
+train_loader = DataLoaderLite(B=B, T=T)
 
 # Configure TF32 precision using new API (PyTorch 2.9+)
 torch.backends.cuda.matmul.fp32_precision = 'tf32'
@@ -508,19 +516,19 @@ optimizer = model.configure_optimizer(
 
 for steps in range(50):
     t0 = time.time()
-    # Get next batch of data
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
-
+   
     # Backward pass: compute gradients
     optimizer.zero_grad()
-
-    with torch.autocast(device_type=device, dtype=torch.bfloat16 if device == 'cuda' else torch.float32):
-        # Forward pass: compute predictions and loss
-        logits, loss = model(x, y)
-        # import code; code.interact(local=locals())
-
-    loss.backward()
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16 if device == 'cuda' else torch.float32):
+            # Forward pass: compute predictions and loss
+            logits, loss = model(x, y)
+            # import code; code.interact(local=locals())
+        loss = loss / grad_accum_steps
+        loss.backward()
+        
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
     lr = get_lr(steps)
