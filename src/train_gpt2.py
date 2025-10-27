@@ -519,6 +519,7 @@ for steps in range(50):
    
     # Backward pass: compute gradients
     optimizer.zero_grad()
+    loss_accum = 0.0
     for micro_step in range(grad_accum_steps):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
@@ -527,6 +528,7 @@ for steps in range(50):
             logits, loss = model(x, y)
             # import code; code.interact(local=locals())
         loss = loss / grad_accum_steps
+        loss_accum += loss.detach()
         loss.backward()
         
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -541,10 +543,10 @@ for steps in range(50):
 
     t1 = time.time()
     dt = (t1 - t0) * 1000
-    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    tokens_per_sec = (train_loader.B * train_loader.T * grad_accum_steps) / (t1 - t0)
 
     # Log training progress
-    print(f"Step {steps:4d}, Loss: {loss.item():.6f}, norm: {norm:.4f}, Time per batch: {dt:.2f} ms, tokens/sec: {tokens_per_sec:.2f}")
+    print(f"Step {steps:4d}, Loss: {loss_accum.item():.6f}, norm: {norm:.4f}, Time per batch: {dt:.2f} ms, tokens/sec: {tokens_per_sec:.2f}")
 
 # Training complete - exit before generation code
 import sys; sys.exit(0)
